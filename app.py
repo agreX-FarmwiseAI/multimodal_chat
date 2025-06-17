@@ -4,7 +4,7 @@ import pandas as pd
 import psycopg2
 import os
 import json
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.dialects.postgresql import VARCHAR
 from geoalchemy2 import Geometry
 from streamlit_folium import st_folium
@@ -19,6 +19,7 @@ from shapely import wkb, wkt
 from shapely.geometry import mapping
 from shapely.geometry import shape
 import geojson
+from geoalchemy2 import WKTElement
 import binascii
 # ---------- CONFIGURATION ---------- #
 st.set_page_config(layout="wide")
@@ -336,18 +337,34 @@ def generate_sql_query_dynamic(user_question: str) -> str:
         return f"An error occurred while calling the API: {e}"
 
 
+from sqlalchemy import text
+import streamlit as st
+
 def delete_all_tables():
-    with engine.connect() as conn:
-        tables = conn.execute(text("""
-            SELECT table_name FROM information_schema.tables
-            WHERE table_schema = 'public'
-        """)).fetchall()
-        for (table,) in tables:
-            conn.execute(text(f'DROP TABLE IF EXISTS "{table}" CASCADE'))
+    with engine.begin() as conn:
+        inspector = inspect(conn)
+        table_names = [
+            table for table in inspector.get_table_names(schema='public')
+            if table not in (
+                'geometry_columns',
+                'geography_columns',
+                'spatial_ref_sys',
+                'raster_columns',
+                'raster_overviews',
+                'topology'
+            )
+        ]
+
+        for table in table_names:
+            conn.execute(text(f'DROP TABLE IF EXISTS public."{table}" CASCADE'))
+        conn.commit()
+
+    # Reset session state
     st.session_state.uploaded_tables = []
     st.session_state.current_response = {"user": "", "ai": ""}
     st.session_state.geojson_data = None
     st.success("All uploaded tables have been deleted from the schema.")
+
 
 def save_to_postgres(df, table_name):
     geom_col = None
@@ -357,16 +374,19 @@ def save_to_postgres(df, table_name):
             break
 
     if geom_col:
-        df = df.rename_geometry('geometry')  # Standard PostGIS column name
-        df['geometry'] = gdf[geom_col].apply(lambda x: f"SRID=4326;{x.wkt}")
-        #df['geometry'] = df[geom_col].apply(wkt.loads)
+        df = df.rename(columns={geom_col: 'geometry'})      
+        # Convert WKT string to WKTElement with SRID 4326
+        #df['geometry'] = df['geometry'].apply(wkt.loads)
+        df['geometry'] = df['geometry'].apply(lambda x: WKTElement(x.wkt if hasattr(x, "wkt") else x, srid=4326))
+        # Convert to GeoDataFrame for safety
         gdf = gpd.GeoDataFrame(df, geometry='geometry', crs='EPSG:4326')
+        # Save to PostGIS
         gdf.to_sql(
             name=table_name,
             con=engine,
             if_exists='replace',
             index=False,
-            dtype={'geometry': Geometry(geometry_type='GEOMETRY', srid=4326)}
+            dtype={'geometry': Geometry('GEOMETRY', srid=4326)}
         )
     else:
         df.to_sql(
@@ -402,7 +422,7 @@ def display_map(geojson_data):
     if not geojson_data:
         # Create base map with satellite layer
         m = folium.Map(location=[11.0, 78.0], zoom_start=6)
-        
+
         # Add satellite layer
         folium.TileLayer(
             tiles='https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}',
@@ -411,22 +431,21 @@ def display_map(geojson_data):
             overlay=False,
             control=True
         ).add_to(m)
-        
-        # Add OSM layer as an option
-        # folium.TileLayer(
-        #     tiles='openstreetmap',
-        #     attr='OpenStreetMap',
-        #     name='OpenStreetMap',
-        #     overlay=False,
-        #     control=True
-        # ).add_to(m)
-        
+
         folium.LayerControl().add_to(m)
         return st_folium(m, width=900, height=600)
-    
-    # Create map with satellite as default
-    m = folium.Map(location=[11.0, 78.0], zoom_start=6)
-    
+
+    # Convert geojson_data to GeoDataFrame to get bounds
+    if isinstance(geojson_data, dict):
+        gdf = gpd.GeoDataFrame.from_features(geojson_data["features"])
+    else:
+        gdf = gpd.GeoDataFrame.from_features(json.loads(geojson_data)["features"])
+
+    bounds = gdf.total_bounds  # [minx, miny, maxx, maxy]
+
+    # Create map with satellite as default, centered initially (will update with fit_bounds)
+    m = folium.Map(zoom_start=6)
+
     # Add satellite layer
     folium.TileLayer(
         tiles='https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}',
@@ -435,19 +454,13 @@ def display_map(geojson_data):
         overlay=False,
         control=True
     ).add_to(m)
-    
-    # Add OSM layer as an option
-    # folium.TileLayer(
-    #     tiles='openstreetmap',
-    #     attr='OpenStreetMap',
-    #     name='OpenStreetMap',
-    #     overlay=False,
-    #     control=True
-    # ).add_to(m)
-    
+
     # Add the GeoJSON data
     folium.GeoJson(geojson_data, name="GeoData").add_to(m)
-    
+
+    # Fit map to GeoJSON bounds
+    m.fit_bounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]])
+
     folium.LayerControl().add_to(m)
     return st_folium(m, width=900, height=600)
 
