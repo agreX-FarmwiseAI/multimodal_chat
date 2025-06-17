@@ -16,6 +16,7 @@ import tempfile
 from shapely import wkt
 from typing import Dict, Any, List, Optional
 from shapely import wkb, wkt
+from shapely.geometry import mapping
 from shapely.geometry import shape
 import geojson
 import binascii
@@ -27,6 +28,7 @@ litellm.drop_params = True
 litellm.telemetry = False
 litellm.api_key = "AIzaSyACE6JsSmb9jMyhf8q-ZpPcbt8Xid1cVak"
 model_name = "gemini/gemini-2.5-flash-preview-04-17"
+database_schema = ""
 DYNAMIC_PROMPT_TEMPLATE = """
 You are an expert PostgreSQL/PostGIS query writer. Your primary function is to convert a user's natural language question into a single, precise, and executable SQL query based on the provided database schema, capabilities, and a strict set of rules.
 
@@ -132,87 +134,69 @@ def convert_geometries_to_geojson(geometries: list[dict[str, Any]]) -> dict[str,
     return geojson.FeatureCollection(features)
 
 def frame_response_from_sql_results(result):
+    print(f"sql_results: {result}")
 
-    if isinstance(result, str) and (("geometry" in result) or ("buffer" in result)):
+    #if isinstance(result, list) and all(isinstance(row, tuple) for row in result):
+    print("YEs")
+    geojson_features = []
+    result_without_geometry = []
+
+    for row in result:
+        if not row:
+            continue
+
+        geometry_candidate = row[0]
         try:
-            # First, ensure the result string is properly formatted
-            cleaned_result = result.strip()
-            
-            # Try to parse the result directly first
-            try:
-                # Attempt to parse as JSON first
-                parsed_result = json.loads(cleaned_result)
-                
-                # Handle both object and array cases
-                if isinstance(parsed_result, dict):
-                    # Single JSON object
-                    json_list = [parsed_result]
-                elif isinstance(parsed_result, list):
-                    # Already a JSON array
-                    json_list = parsed_result
-                else:
-                    print(f"Unexpected JSON type: {type(parsed_result)}")
-                    return {"result": result, "geojson": None}
-                    
-            except json.JSONDecodeError:
-                # If direct parsing fails, try to handle as concatenated JSON objects
-                try:
-                    # Handle multiple JSON objects separated by newlines
-                    cleaned_result = cleaned_result.replace('}\n{', '},{')
-                    if not cleaned_result.startswith('['):
-                        json_array_str = f"[{cleaned_result}]"
-                    else:
-                        json_array_str = cleaned_result
-                        
-                    json_list = json.loads(json_array_str)
-                except json.JSONDecodeError as e:
-                    print(f"Failed to parse JSON string: {e}")
-                    print(f"Problematic JSON string: {json_array_str}")
-                    return {"result": result, "geojson": None}
-            
-            # Process the parsed JSON list
-            geometries = [
-                obj for obj in json_list
-                if isinstance(obj, dict) and any(
-                    ("geometry" in k.lower() or "buffer" in k.lower()) for k in obj.keys()
-                )
-            ]
-            print("geometries:", geometries)
-            if geometries:
-                try:
-                    # The convert function expects a list of objects that have geometry
-                    geojson_result = convert_geometries_to_geojson(geometries)
-                except Exception as e:
-                    print(f"Error converting geometries to GeoJSON: {e}")
-                    geojson_result = None
+            # Try parsing as WKB hex
+            if isinstance(geometry_candidate, str) and geometry_candidate.startswith('010'):  # basic check
+                geometry = wkb.loads(bytes.fromhex(geometry_candidate))
+            elif isinstance(geometry_candidate, bytes):
+                geometry = wkb.loads(geometry_candidate)
             else:
-                print("Geometries not found")
-            # Remove geometry from the result objects
-            results_without_geometry = []
-            for obj in json_list:
-                if isinstance(obj, dict):
-                    results_without_geometry.append({k: v for k, v in obj.items() if "geometry" not in k.lower() and "buffer" not in k.lower()})
+                continue
+
+            # Build GeoJSON feature
+            feature = {
+                "type": "Feature",
+                "geometry": mapping(geometry),
+                "properties": {}
+            }
+
+            # Handle remaining data as properties
+            if len(row) > 1:
+                if isinstance(row[1], dict):
+                    feature["properties"] = row[1]
+                    result_without_geometry.append(row[1])
                 else:
-                    results_without_geometry.append(obj)
+                    props = {f"col_{i}": val for i, val in enumerate(row[1:], start=1)}
+                    feature["properties"] = props
+                    result_without_geometry.append(props)
+            else:
+                result_without_geometry.append({})
 
-            # If there was only one object originally, return a single object not a list
-            final_result = results_without_geometry
-            if len(results_without_geometry) == 1:
-                final_result = results_without_geometry[0]
+            geojson_features.append(feature)
 
-            return {"result": final_result, "geojson": geojson_result}
+        except Exception as e:
+            print(f"Error processing row as geometry: {e}")
 
-        except (json.JSONDecodeError, ValueError) as e:
-            print(f"Error parsing geometry from result string: {e}")
-    
-    # If no geometry found or error occurred, return original result with None for geojson
+    if geojson_features:
+        return {
+            "result": result_without_geometry if len(result_without_geometry) > 1 else result_without_geometry[0],
+            "geojson": {
+                "type": "FeatureCollection",
+                "features": geojson_features
+            }
+        }
+
+    # fallback
     return {"result": result, "geojson": None}
 
 def chat_llm(user_input):
     # Simplified for demo - in real implementation, this would return geojson too
-    schema = format_schema_for_prompt()
+    
     sql_results = ""
-    sql_query = generate_sql_query_dynamic(user_input,schema)
+    sql_query = generate_sql_query_dynamic(user_input)
+    print(f"sql_query:{sql_query}")
     with engine.begin() as conn:
         sql_results = conn.execute(text(sql_query)).fetchall()
 
@@ -253,45 +237,6 @@ def call_llm(prompt):
     msg = [{"role": "user", "content": f"{prompt}"}]
     response = completion(model=model_name, messages=msg)
     return response.choices[0].message.content.strip()
-
-def fetch_schema_summary():
-    with engine.begin() as conn:
-        tables = conn.execute(text("""
-            SELECT tablename FROM pg_tables 
-            WHERE schemaname = 'public' AND tablename NOT LIKE 'spatial_ref_sys'
-        """)).fetchall()
-
-        if not tables:
-            return ""
-
-        sql_queries = [f'SELECT * FROM public."{table[0]}"' for table in tables]
-        llm_prompt = """
-You are a professional geospatial database documentation assistant.
-
-I will provide you with one or more SQL queries (e.g., SELECT * FROM public."table_name") that represent geospatial datasets.
-
-For each table, generate a structured and professional schema documentation in the format below:
-
-DATABASE SCHEMA – public."table_name"  
-TABLE DESCRIPTION:  
-[A concise and meaningful description of what the table represents, ideally inferred from the table name and common GIS/infrastructure context.]  
- 
-COLUMNS:  
-- column_name (data_type): [One-line explanation of the column’s purpose, derived from common geospatial, infrastructure, or domain-related terminology.]  
-- ... (repeat for all columns)
-
-✅ Guidelines:  
-- Format the table name exactly as: public."table_name"  
-- Provide clear, human-readable summaries inferred from column names (e.g., geom, lat, lon, id, village_name, taluk_code, ndvi_score).  
-- Be GIS-aware and domain-aware. Use terminology relevant to spatial databases, remote sensing, agriculture, infrastructure, or urban planning.  
-- Maintain clarity and professionalism — this summary is intended for end-user documentation, developers, and data analysts.  
-- If the geometry column exists, note the spatial reference system (assume EPSG:4326 unless otherwise specified).
-
-I will provide multiple queries. Repeat this structure for each SQL `SELECT` query I send.
-
-""" + "\n".join(sql_queries)
-
-    return call_llm(llm_prompt)
 
 def get_dynamic_schema_from_db(schema_name: str = 'public') -> dict:   
     schema_data = {}
@@ -351,7 +296,7 @@ def format_schema_for_prompt():
         
     return schema_string.strip()
 
-def generate_sql_query_dynamic(user_question: str, schema_definition: str) -> str:
+def generate_sql_query_dynamic(user_question: str) -> str:
     """
     Generates a SQL query using a dynamic schema.
 
@@ -362,11 +307,12 @@ def generate_sql_query_dynamic(user_question: str, schema_definition: str) -> st
     Returns:
         A string containing the generated SQL query.
     """
+    database_schema = st.session_state.schema_summary
     final_prompt = DYNAMIC_PROMPT_TEMPLATE.format(
-        schema_definition=schema_definition,
+        schema_definition=database_schema,
         user_question=user_question
     )
-
+    print(f"Database Schema : {database_schema}")
     messages = [{"role": "user", "content": final_prompt}]
 
     try:
@@ -411,7 +357,9 @@ def save_to_postgres(df, table_name):
             break
 
     if geom_col:
-        df['geometry'] = df[geom_col].apply(wkt.loads)
+        df = df.rename_geometry('geometry')  # Standard PostGIS column name
+        df['geometry'] = gdf[geom_col].apply(lambda x: f"SRID=4326;{x.wkt}")
+        #df['geometry'] = df[geom_col].apply(wkt.loads)
         gdf = gpd.GeoDataFrame(df, geometry='geometry', crs='EPSG:4326')
         gdf.to_sql(
             name=table_name,
@@ -504,6 +452,7 @@ def display_map(geojson_data):
     return st_folium(m, width=900, height=600)
 
 def process_uploaded_files(uploaded_files):
+    global database_schema
     uploaded_tables = []
     with st.spinner("Processing files..."):
         progress_bar = st.progress(0)
@@ -517,9 +466,9 @@ def process_uploaded_files(uploaded_files):
                 save_to_postgres(df, table_name)
                 uploaded_tables.append(table_name)
         
-        #progress_bar.progress(1.0, text="Generating schema metadata...")
-        #schema_summary = fetch_schema_summary()
-        #st.session_state.schema_summary = schema_summary
+        progress_bar.progress(1.0, text="Generating schema metadata...")
+        database_schema = format_schema_for_prompt()
+        st.session_state.schema_summary = database_schema
         
     return uploaded_tables
 
@@ -538,11 +487,12 @@ with st.sidebar:
         st.success("Files uploaded. Confirm to convert to database.")
         if st.button("Upload"):
             st.session_state.uploaded_tables = process_uploaded_files(uploaded_files)
+            
             st.success("All files processed and schema metadata generated!")
             # Initialize AI greeting
             st.session_state.current_response = {"user": "", "ai": "Your geospatial data is ready! Ask me anything about it."}
     
-    if st.button("❌ Delete All Data"):
+    if st.button("❌ Delete Exists"):
         delete_all_tables()
 
 # Create persistent columns layout
@@ -579,6 +529,7 @@ with col1:
         # Get AI response
         with st.spinner("Thinking..."):
             text_response, geojson_output = chat_llm(prompt)
+            print(f"text:{text_response},Geojson:{geojson_output}")
             st.session_state.current_response["ai"] = text_response
             st.session_state.geojson_data = geojson_output
             st.rerun()
