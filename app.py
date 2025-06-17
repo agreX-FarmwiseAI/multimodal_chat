@@ -214,7 +214,7 @@ def chat_llm(user_input):
     sql_results = ""
     sql_query = generate_sql_query_dynamic(user_input,schema)
     with engine.begin() as conn:
-        sql_results = conn.execute(sql_query).fetchall()
+        sql_results = conn.execute(text(sql_query)).fetchall()
 
     result = frame_response_from_sql_results(sql_results)
     result['user_query'] = user_input       
@@ -224,7 +224,7 @@ def chat_llm(user_input):
            
     return final_response["final_response"],final_response["geojson"]
 
-def generate_final_response(self, results: Dict[str, Any]) -> str:
+def generate_final_response(results: Dict[str, Any]) -> str:
         """Generate a cohesive final response from sub-agent results."""
         try:
             #print("results", results['result'])
@@ -536,7 +536,7 @@ with st.sidebar:
 
     if uploaded_files:
         st.success("Files uploaded. Confirm to convert to database.")
-        if st.button("Confirm & Convert"):
+        if st.button("Upload"):
             st.session_state.uploaded_tables = process_uploaded_files(uploaded_files)
             st.success("All files processed and schema metadata generated!")
             # Initialize AI greeting
