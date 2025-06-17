@@ -1,0 +1,12 @@
+streamlit
+geopandas
+pandas
+psycopg2-binary
+sqlalchemy
+geoalchemy2
+streamlit-folium
+folium
+litellm
+shapely
+openpyxl
+geojson
