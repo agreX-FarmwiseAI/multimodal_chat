@@ -222,7 +222,7 @@ def chat_llm(user_input):
     final_response = generate_final_response(result)
     result["final_response"] = final_response
            
-    return final_response["final_response"],final_response["geojson"]
+    return result["final_response"],result["geojson"]
 
 def generate_final_response(results: Dict[str, Any]) -> str:
         """Generate a cohesive final response from sub-agent results."""
